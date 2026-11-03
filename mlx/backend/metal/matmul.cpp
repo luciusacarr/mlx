@@ -1225,6 +1225,30 @@ void gemv_axbpy(
 
   int mat_ld = is_b_matrix ? ldb : lda;
 
+  // gemv_t reduces all of K in few threadgroups. Use split-K when K is large
+  // compared to the output. Not tuned for NAX devices.
+  if (!metal::is_nax_available() && transpose_mat && batch_size_out == 1 &&
+      K >= 2048 && K >= 4 * out_vector_len) {
+    return steel_gemm_splitk_axpby<CHECK_AB>(
+        /* const Stream& s = */ s,
+        /* metal::Device& d = */ d,
+        /* const array& a = */ a,
+        /* const array& b = */ b,
+        /* const array& c = */ c,
+        /* array& out = */ out,
+        /* int M = */ M,
+        /* int N = */ N,
+        /* int K = */ K,
+        /* int batch_size_out = */ batch_size_out,
+        /* int lda = */ lda,
+        /* int ldb = */ ldb,
+        /* bool transpose_a = */ transpose_a,
+        /* bool transpose_b = */ transpose_b,
+        /* std::vector<array>& copies = */ copies,
+        /* float alpha = */ alpha,
+        /* float beta = */ beta);
+  }
+
   auto batch_strides_mat = is_b_matrix ? B_batch_stride : A_batch_stride;
   auto batch_strides_vec = is_b_matrix ? A_batch_stride : B_batch_stride;
 

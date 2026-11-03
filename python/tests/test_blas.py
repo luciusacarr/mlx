@@ -554,6 +554,52 @@ class TestBlas(mlx_tests.MLXTestCase):
                                     )
                                     self.assertTrue(np.array_equal(c_mlx, c_npy))
 
+    def test_vector_matrix_large_k(self):
+        # Vector and matrix products with a large K and a small output.
+        # Outputs are O(1), so a wrong or missing column fails the check.
+        np.random.seed(0)
+        for dtype, tol in (
+            (mx.float32, 1e-4),
+            (mx.float16, 2e-3),
+            (mx.bfloat16, 1e-2),
+        ):
+            for K, N in ((2048, 2), (4099, 24), (16384, 33), (8192, 2048)):
+                scale = K**-0.5
+                w = mx.array(
+                    np.random.normal(0.0, scale, (K, N + 4)).astype(np.float32)
+                ).astype(dtype)
+                v = mx.array(np.random.normal(0.0, 1.0, (1, K)).astype(np.float32))
+                v = v.astype(dtype)
+                c = mx.array(np.random.normal(0.0, 1.0, (N,)).astype(np.float32))
+                c = c.astype(dtype)
+                w_np, v_np, c_np = (
+                    np.array(x.astype(mx.float32), dtype=np.float64) for x in (w, v, c)
+                )
+
+                w_s, w_s_np = w[:, 2 : N + 2], w_np[:, 2 : N + 2]
+                w_c = mx.array(w_np[:, :N].astype(np.float32)).astype(dtype)
+                cases = (
+                    ("vec_mat", v @ w_c, v_np @ w_np[:, :N]),
+                    ("vec_mat_sliced", v @ w_s, v_np @ w_s_np),
+                    ("mat_t_vec", w_c.T @ v.T, w_np[:, :N].T @ v_np.T),
+                    (
+                        "addmm",
+                        mx.addmm(c, v, w_s, alpha=0.5, beta=2.0),
+                        0.5 * (v_np @ w_s_np) + 2.0 * c_np,
+                    ),
+                    (
+                        "addmm_mat_t_vec",
+                        mx.addmm(c[:, None], w_s.T, v.T, alpha=0.5, beta=2.0),
+                        0.5 * (w_s_np.T @ v_np.T) + 2.0 * c_np[:, None],
+                    ),
+                )
+                for name, out, ref in cases:
+                    with self.subTest(dtype=str(dtype), K=K, N=N, case=name):
+                        self.assertEqual(out.shape, ref.shape)
+                        out = np.array(out.astype(mx.float32), dtype=np.float64)
+                        err = np.abs(out - ref).max() / np.abs(ref).max()
+                        self.assertLess(err, tol)
+
     def test_dot_product(self):
         if mx.default_device() == mx.cpu:
             self.skipTest("requires GPU")
