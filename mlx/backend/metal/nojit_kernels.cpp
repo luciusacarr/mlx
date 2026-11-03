@@ -257,6 +257,21 @@ MTL::ComputePipelineState* get_gemv_kernel(
   return d.get_kernel(kernel_name);
 }
 
+MTL::ComputePipelineState* get_gemv_multi_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array&,
+    int,
+    int,
+    int,
+    int,
+    int,
+    bool) {
+  return d.get_kernel(kernel_name, hash_name, func_consts);
+}
+
 MTL::ComputePipelineState* get_gemv_gather_kernel(
     metal::Device& d,
     const std::string& kernel_name,

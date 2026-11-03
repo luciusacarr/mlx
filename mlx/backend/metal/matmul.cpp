@@ -1546,6 +1546,132 @@ bool gemv_wide(
   return true;
 }
 
+struct GemvMultiConfig {
+  int bm;
+  int bn;
+  int tm;
+  int tn;
+  int nv;
+};
+
+// Few rows of a against a small transposed b: one gemv_multi dispatch that
+// reads b once per group of up to 8 rows. Bounds measured on M2 Pro.
+// Half types use it only where gemv_wide is off (before gen 15).
+std::optional<GemvMultiConfig> gemv_multi_config(
+    metal::Device& d,
+    const array& a,
+    int M,
+    int N,
+    int K,
+    bool a_transposed,
+    bool b_transposed) {
+  bool half_type = a.dtype() == float16 || a.dtype() == bfloat16;
+  if (a.dtype() != float32 && !(half_type && d.get_architecture_gen() < 15)) {
+    return std::nullopt;
+  }
+  if (a_transposed || !b_transposed || M <= 1 || M > 16 || N <= 1 ||
+      M * N > 512) {
+    return std::nullopt;
+  }
+  // Small outputs need more threadgroups, larger ones reuse each vector
+  // load across more rows
+  int bn = K >= 4096 ? 16 : 8;
+  if (M * N <= 64) {
+    return GemvMultiConfig{1, bn, (N <= 16 && M <= 4) ? 1 : 2, 4, 2};
+  }
+  if (N <= 8 || (N <= 16 && M <= 8)) {
+    return GemvMultiConfig{1, bn, 2, 4, 4};
+  }
+  if (N <= 24 && M <= 6) {
+    return GemvMultiConfig{1, bn, 2, 4, (M > 2 && M <= 4) ? 4 : 2};
+  }
+  bool nv8 = K >= 16384 &&
+      ((N >= 64 && M > 4) || (N >= 32 && M > 8) || (N >= 24 && M > 12));
+  return GemvMultiConfig{1, 8, 4, 4, M <= 2 ? 2 : (nv8 ? 8 : 4)};
+}
+
+void gemv_multi(
+    const Stream& s,
+    metal::Device& d,
+    const array& mat,
+    const array& in_vec,
+    array& out,
+    int M,
+    int N,
+    int K,
+    int mat_ld,
+    int vec_ld,
+    int batch_size_out,
+    const Shape& batch_shape,
+    const Strides& mat_batch_stride,
+    const Strides& vec_batch_stride,
+    std::vector<array>& copies,
+    const GemvMultiConfig& c,
+    const array* bias = nullptr,
+    const Strides* bias_batch_stride = nullptr,
+    float alpha = 1.0f,
+    float beta = 0.0f) {
+  bool nc = batch_shape.size() > 1;
+  bool do_axpby = bias != nullptr;
+  int batch_ndim = batch_shape.size();
+  std::ostringstream kname;
+  kname << "gemv_multi_" << type_to_name(out) << "_bm" << c.bm << "_bn"
+        << c.bn << "_tm" << c.tm << "_tn" << c.tn << "_nv" << c.nv << "_nc"
+        << nc;
+  std::string hash_name = kname.str() + (do_axpby ? "_axpby1" : "_axpby0");
+  metal::MTLFCList func_consts = {
+      {&do_axpby, MTL::DataType::DataTypeBool, 2}};
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  auto kernel = get_gemv_multi_kernel(
+      d,
+      kname.str(),
+      hash_name,
+      func_consts,
+      out,
+      c.bm,
+      c.bn,
+      c.tm,
+      c.tn,
+      c.nv,
+      nc);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  int rows_per_tgp = c.bm * c.tm;
+  MTL::Size group_dims(32, c.bn, c.bm);
+  MTL::Size grid_dims(
+      (N + rows_per_tgp - 1) / rows_per_tgp,
+      (M + c.nv - 1) / c.nv,
+      batch_size_out);
+
+  compute_encoder.set_input_array(mat, 0);
+  compute_encoder.set_input_array(in_vec, 1);
+  compute_encoder.set_output_array(out, 3);
+  compute_encoder.set_bytes(K, 4);
+  compute_encoder.set_bytes(N, 5);
+  compute_encoder.set_bytes(mat_ld, 6);
+  compute_encoder.set_bytes(vec_ld, 7);
+  compute_encoder.set_bytes(M, 8);
+  compute_encoder.set_bytes(batch_ndim, 9);
+  compute_encoder.set_vector_bytes(batch_shape, 10);
+  compute_encoder.set_vector_bytes(vec_batch_stride, 11);
+  compute_encoder.set_vector_bytes(mat_batch_stride, 12);
+
+  if (do_axpby) {
+    compute_encoder.set_input_array(*bias, 2);
+    compute_encoder.set_bytes(alpha, 13);
+    compute_encoder.set_bytes(beta, 14);
+    compute_encoder.set_vector_bytes(*bias_batch_stride, 15);
+    int bias_ld = bias->strides()[bias->ndim() - 2];
+    int bias_fd = bias->strides()[bias->ndim() - 1];
+    compute_encoder.set_bytes(bias_ld, 16);
+    compute_encoder.set_bytes(bias_fd, 17);
+  }
+
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  compute_encoder.add_temporaries(std::move(copies));
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // Matmul implementation
 ///////////////////////////////////////////////////////////////////////////////
@@ -1641,6 +1767,27 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           /* float alpha = */ 1.0f,
           /* float beta = */ 0.0f)) {
     return;
+  }
+
+  if (auto c =
+          gemv_multi_config(d, a, M, N, K, a_transposed, b_transposed)) {
+    return gemv_multi(
+        /* const Stream& s = */ s,
+        /* metal::Device& d = */ d,
+        /* const array& mat = */ b,
+        /* const array& in_vec = */ a,
+        /* array& out = */ out,
+        /* int M = */ M,
+        /* int N = */ N,
+        /* int K = */ K,
+        /* int mat_ld = */ b_cols,
+        /* int vec_ld = */ a_cols,
+        /* int batch_size_out = */ static_cast<int>(batch_size_out),
+        /* const Shape& batch_shape = */ batch_shape,
+        /* const Strides& mat_batch_stride = */ B_batch_stride,
+        /* const Strides& vec_batch_stride = */ A_batch_stride,
+        /* std::vector<array>& copies = */ copies,
+        /* const GemvMultiConfig& c = */ *c);
   }
 
   // Route to gemv if needed
@@ -1799,6 +1946,31 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
           /* float alpha = */ alpha_,
           /* float beta = */ beta_)) {
     return;
+  }
+
+  if (auto cfg =
+          gemv_multi_config(d, a, M, N, K, transpose_a, transpose_b)) {
+    return gemv_multi(
+        /* const Stream& s = */ s,
+        /* metal::Device& d = */ d,
+        /* const array& mat = */ b,
+        /* const array& in_vec = */ a,
+        /* array& out = */ out,
+        /* int M = */ M,
+        /* int N = */ N,
+        /* int K = */ K,
+        /* int mat_ld = */ ldb,
+        /* int vec_ld = */ lda,
+        /* int batch_size_out = */ static_cast<int>(batch_size_out),
+        /* const Shape& batch_shape = */ batch_shape,
+        /* const Strides& mat_batch_stride = */ B_batch_stride,
+        /* const Strides& vec_batch_stride = */ A_batch_stride,
+        /* std::vector<array>& copies = */ copies,
+        /* const GemvMultiConfig& c = */ *cfg,
+        /* const array* bias = */ &c,
+        /* const Strides* bias_batch_stride = */ &C_batch_stride,
+        /* float alpha = */ alpha_,
+        /* float beta = */ beta_);
   }
 
   // Route to gemv if needed

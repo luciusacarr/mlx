@@ -237,6 +237,19 @@ MTL::ComputePipelineState* get_gemv_kernel(
     bool nc,
     bool axpby);
 
+MTL::ComputePipelineState* get_gemv_multi_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array& out,
+    int bm,
+    int bn,
+    int tm,
+    int tn,
+    int nv,
+    bool nc);
+
 MTL::ComputePipelineState* get_gemv_gather_kernel(
     metal::Device& d,
     const std::string& kernel_name,

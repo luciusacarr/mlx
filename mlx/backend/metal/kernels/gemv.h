@@ -475,11 +475,14 @@ template <
 
   // Update batch offsets
   if (kDoNCBatch) {
-    in_vec += elem_to_loc(tid.z, batch_shape, vector_batch_stride, batch_ndim);
-    mat += elem_to_loc(tid.z, batch_shape, matrix_batch_stride, batch_ndim);
+    in_vec += elem_to_loc<int64_t>(
+        tid.z, batch_shape, vector_batch_stride, batch_ndim);
+    mat += elem_to_loc<int64_t>(
+        tid.z, batch_shape, matrix_batch_stride, batch_ndim);
 
     if (kDoAxpby) {
-      bias += elem_to_loc(tid.z, batch_shape, bias_batch_stride, batch_ndim);
+      bias += elem_to_loc<int64_t>(
+          tid.z, batch_shape, bias_batch_stride, batch_ndim);
     }
 
   } else {
@@ -602,6 +605,272 @@ template <
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+/// Matrix multi-vector multiplication
+///////////////////////////////////////////////////////////////////////////////
+
+// Load N contiguous elements; float uses packed vector loads.
+template <typename T, int N>
+struct GEMVMultiLoad {
+  template <typename U>
+  static METAL_FUNC void load(const device T* src, thread U* dst) {
+    MLX_MTL_PRAGMA_UNROLL
+    for (int i = 0; i < N; i++) {
+      dst[i] = static_cast<U>(src[i]);
+    }
+  }
+};
+
+template <int N>
+struct GEMVMultiLoad<float, N> {
+  static_assert(N % 4 == 0, "float loads need N divisible by 4");
+  template <typename U>
+  static METAL_FUNC void load(const device float* src, thread U* dst) {
+    MLX_MTL_PRAGMA_UNROLL
+    for (int i = 0; i < N; i += 4) {
+      packed_float4 v = *reinterpret_cast<const device packed_float4*>(src + i);
+      dst[i] = v[0];
+      dst[i + 1] = v[1];
+      dst[i + 2] = v[2];
+      dst[i + 3] = v[3];
+    }
+  }
+};
+
+// out[v] = mat @ in_vec[v] for NV vectors per threadgroup. Each thread loads
+// its block of mat once and applies it to all NV vectors.
+constant bool gemv_multi_do_axpby [[function_constant(2)]];
+
+template <
+    typename T,
+    const int BM, /* Threadgroup rows (in simdgroups) */
+    const int BN, /* Threadgroup cols (in simdgroups) */
+    const int TM, /* Thread rows (in elements) */
+    const int TN, /* Thread cols (in elements) */
+    const int NV, /* Vectors per threadgroup */
+    typename AccT = typename DefaultAccT<T>::type>
+struct GEMVMultiKernel {
+  MLX_MTL_CONST int blockM = BM * TM;
+  MLX_MTL_CONST int blockN = BN * 32 * TN;
+  MLX_MTL_CONST int n_results = NV * TM;
+  MLX_MTL_CONST int tgp_mem_size = BN > 1 ? BM * BN * n_results : 0;
+
+  static METAL_FUNC void run(
+      const device T* mat,
+      const device T* in_vec,
+      device T* out_vec,
+      const int in_vec_size,
+      const int out_vec_size,
+      const int num_vecs,
+      const int matrix_ld,
+      const int vector_ld,
+      const device T* bias,
+      const float alpha,
+      const float beta,
+      const int bias_ld,
+      const int bias_fd,
+      threadgroup AccT* tgp_memory,
+      uint3 tid,
+      uint simd_gid,
+      uint simd_lid) {
+    auto store = [&](int v, int row, AccT val) {
+      if (gemv_multi_do_axpby) {
+        AccT c = static_cast<AccT>(bias[int64_t(v) * bias_ld + row * bias_fd]);
+        val = static_cast<AccT>(alpha) * val + static_cast<AccT>(beta) * c;
+      }
+      out_vec[int64_t(v) * out_vec_size + row] = static_cast<T>(val);
+    };
+    thread AccT result[NV][TM] = {{0}};
+    thread AccT w[TM][TN];
+
+    const int sgN = BN > 1 ? simd_gid % BN : 0;
+    const int sgM = BN > 1 ? simd_gid / BN : int(simd_gid);
+
+    // Tail rows shift inwards; rows past the end are computed but not stored
+    int out_row = tid.x * blockM + sgM * TM;
+    const bool row_valid = out_row < out_vec_size;
+    out_row = min(out_row, out_vec_size - TM);
+    mat += int64_t(out_row) * matrix_ld;
+
+    // Vectors past num_vecs repeat the last one and are not stored
+    const int vec0 = tid.y * NV;
+    const device T* vecs[NV];
+    MLX_MTL_PRAGMA_UNROLL
+    for (int v = 0; v < NV; v++) {
+      vecs[v] = in_vec + int64_t(min(vec0 + v, num_vecs - 1)) * vector_ld;
+    }
+
+    int bn = (sgN * 32 + int(simd_lid)) * TN;
+    const int n_iter = in_vec_size / blockN;
+    const int leftover = in_vec_size - n_iter * blockN;
+
+    for (int i = 0; i < n_iter; ++i) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (int tm = 0; tm < TM; tm++) {
+        GEMVMultiLoad<T, TN>::load(mat + tm * matrix_ld + bn, w[tm]);
+      }
+      MLX_MTL_PRAGMA_UNROLL
+      for (int v = 0; v < NV; v++) {
+        thread AccT x[TN];
+        GEMVMultiLoad<T, TN>::load(vecs[v] + bn, x);
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tn = 0; tn < TN; tn++) {
+          MLX_MTL_PRAGMA_UNROLL
+          for (int tm = 0; tm < TM; tm++) {
+            result[v][tm] += w[tm][tn] * x[tn];
+          }
+        }
+      }
+      bn += blockN;
+    }
+
+    if (leftover > 0) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (int tn = 0; tn < TN; tn++) {
+        const bool in_bounds = bn + tn < in_vec_size;
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tm = 0; tm < TM; tm++) {
+          w[tm][tn] = in_bounds
+              ? static_cast<AccT>(mat[tm * matrix_ld + bn + tn])
+              : AccT(0);
+        }
+        MLX_MTL_PRAGMA_UNROLL
+        for (int v = 0; v < NV; v++) {
+          AccT x = in_bounds ? static_cast<AccT>(vecs[v][bn + tn]) : AccT(0);
+          MLX_MTL_PRAGMA_UNROLL
+          for (int tm = 0; tm < TM; tm++) {
+            result[v][tm] += w[tm][tn] * x;
+          }
+        }
+      }
+    }
+
+    MLX_MTL_PRAGMA_UNROLL
+    for (int v = 0; v < NV; v++) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (int tm = 0; tm < TM; tm++) {
+        result[v][tm] = simd_sum(result[v][tm]);
+      }
+    }
+
+    if (BN > 1) {
+      // Sum the partial results of the simdgroups that share these rows
+      threadgroup AccT* tgp_results = tgp_memory + sgM * BN * n_results;
+      if (simd_lid == 0) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int v = 0; v < NV; v++) {
+          MLX_MTL_PRAGMA_UNROLL
+          for (int tm = 0; tm < TM; tm++) {
+            tgp_results[sgN * n_results + v * TM + tm] = result[v][tm];
+          }
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sgN == 0 && row_valid) {
+        for (int idx = simd_lid; idx < n_results; idx += 32) {
+          AccT sum = 0;
+          for (int sgn = 0; sgn < BN; sgn++) {
+            sum += tgp_results[sgn * n_results + idx];
+          }
+          const int v = idx / TM;
+          if (vec0 + v < num_vecs) {
+            store(vec0 + v, out_row + idx % TM, sum);
+          }
+        }
+      }
+    } else if (simd_lid == 0 && row_valid) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (int v = 0; v < NV; v++) {
+        if (vec0 + v < num_vecs) {
+          MLX_MTL_PRAGMA_UNROLL
+          for (int tm = 0; tm < TM; tm++) {
+            store(vec0 + v, out_row + tm, result[v][tm]);
+          }
+        }
+      }
+    }
+  }
+};
+
+template <
+    typename T,
+    const int BM, /* Threadgroup rows (in simdgroups) */
+    const int BN, /* Threadgroup cols (in simdgroups) */
+    const int TM, /* Thread rows (in elements) */
+    const int TN, /* Thread cols (in elements) */
+    const int NV, /* Vectors per threadgroup */
+    const bool kDoNCBatch> /* Batch ndim > 1 */
+[[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]] void gemv_multi(
+    const device T* mat [[buffer(0)]],
+    const device T* in_vec [[buffer(1)]],
+    device T* out_vec [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    const constant int& matrix_ld [[buffer(6)]],
+    const constant int& vector_ld [[buffer(7)]],
+    const constant int& num_vecs [[buffer(8)]],
+    const constant int& batch_ndim [[buffer(9)]],
+    const constant int* batch_shape [[buffer(10)]],
+    const constant int64_t* vector_batch_stride [[buffer(11)]],
+    const constant int64_t* matrix_batch_stride [[buffer(12)]],
+    const device T* bias [[buffer(2), function_constant(gemv_multi_do_axpby)]],
+    const constant float& alpha
+    [[buffer(13), function_constant(gemv_multi_do_axpby)]],
+    const constant float& beta
+    [[buffer(14), function_constant(gemv_multi_do_axpby)]],
+    const constant int64_t* bias_batch_stride
+    [[buffer(15), function_constant(gemv_multi_do_axpby)]],
+    const constant int& bias_ld
+    [[buffer(16), function_constant(gemv_multi_do_axpby)]],
+    const constant int& bias_fd
+    [[buffer(17), function_constant(gemv_multi_do_axpby)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  using gemv_kernel = GEMVMultiKernel<T, BM, BN, TM, TN, NV>;
+  threadgroup typename DefaultAccT<T>::type
+      tgp_memory[gemv_kernel::tgp_mem_size == 0 ? 1 : gemv_kernel::tgp_mem_size];
+
+  // Update batch offsets
+  if (kDoNCBatch) {
+    in_vec += elem_to_loc<int64_t>(
+        tid.z, batch_shape, vector_batch_stride, batch_ndim);
+    mat += elem_to_loc<int64_t>(
+        tid.z, batch_shape, matrix_batch_stride, batch_ndim);
+    if (gemv_multi_do_axpby) {
+      bias += elem_to_loc<int64_t>(
+          tid.z, batch_shape, bias_batch_stride, batch_ndim);
+    }
+  } else {
+    in_vec += tid.z * vector_batch_stride[0];
+    mat += tid.z * matrix_batch_stride[0];
+    if (gemv_multi_do_axpby) {
+      bias += tid.z * bias_batch_stride[0];
+    }
+  }
+
+  out_vec += int64_t(tid.z) * num_vecs * out_vec_size;
+
+  gemv_kernel::run(
+      mat,
+      in_vec,
+      out_vec,
+      in_vec_size,
+      out_vec_size,
+      num_vecs,
+      matrix_ld,
+      vector_ld,
+      bias,
+      gemv_multi_do_axpby ? alpha : 1.0f,
+      gemv_multi_do_axpby ? beta : 0.0f,
+      gemv_multi_do_axpby ? bias_ld : 0,
+      gemv_multi_do_axpby ? bias_fd : 0,
+      tgp_memory,
+      tid,
+      simd_gid,
+      simd_lid);
+}
+
+///////////////////////////////////////////////////////////////////////////////
 /// Vector matrix multiplication kernel
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -641,11 +910,14 @@ template <
 
   // Update batch offsets
   if (kDoNCBatch) {
-    in_vec += elem_to_loc(tid.z, batch_shape, vector_batch_stride, batch_ndim);
-    mat += elem_to_loc(tid.z, batch_shape, matrix_batch_stride, batch_ndim);
+    in_vec += elem_to_loc<int64_t>(
+        tid.z, batch_shape, vector_batch_stride, batch_ndim);
+    mat += elem_to_loc<int64_t>(
+        tid.z, batch_shape, matrix_batch_stride, batch_ndim);
 
     if (kDoAxpby) {
-      bias += elem_to_loc(tid.z, batch_shape, bias_batch_stride, batch_ndim);
+      bias += elem_to_loc<int64_t>(
+          tid.z, batch_shape, bias_batch_stride, batch_ndim);
     }
 
   } else {
@@ -928,11 +1200,14 @@ template <typename T, const int vecs_per_tg, const int k_lanes>
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   if (gemv_wide_has_batch) {
-    in_vec += elem_to_loc(tid.z, batch_shape, vector_batch_stride, batch_ndim);
-    mat += elem_to_loc(tid.z, batch_shape, matrix_batch_stride, batch_ndim);
+    in_vec += elem_to_loc<int64_t>(
+        tid.z, batch_shape, vector_batch_stride, batch_ndim);
+    mat += elem_to_loc<int64_t>(
+        tid.z, batch_shape, matrix_batch_stride, batch_ndim);
 
     if (gemv_wide_do_axpby) {
-      bias += elem_to_loc(tid.z, batch_shape, bias_batch_stride, batch_ndim);
+      bias += elem_to_loc<int64_t>(
+          tid.z, batch_shape, bias_batch_stride, batch_ndim);
     }
   } else {
     in_vec += tid.z * vector_batch_stride[0];

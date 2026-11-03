@@ -952,6 +952,37 @@ class TestBlas(mlx_tests.MLXTestCase):
                         ref_c = 0.5 * ref + 2.0 * c_r
                         self.assertTrue(np.allclose(out, ref_c, 1e-2, 0.125 * scale))
 
+    def test_few_rows_matmul(self):
+        # few fp32 rows against a transposed b take the multi-vector gemv on Metal.
+        np.random.seed(0)
+        for M, N, K in [(2, 24, 16384), (3, 5, 1001), (6, 64, 4096), (8, 3, 7)]:
+            a_np = np.random.normal(size=(M, K + 3)).astype(np.float32)
+            b_np = np.random.normal(size=(2, 3, N, K + 1)).astype(np.float32)
+            a, b = mx.array(a_np), mx.array(b_np)
+            a0, b0 = a[:, :K], b[0, 0, :, :K]
+            a0_np, b0_np = a_np[:, :K], b_np[0, 0, :, :K]
+            cases = [
+                (a0 @ b0.T, a0_np @ b0_np.T),
+                (a[:, 3:] @ b[0, 0, :, 1:].T, a_np[:, 3:] @ b_np[0, 0, :, 1:].T),
+                (
+                    mx.broadcast_to(a[:1, :K], (M, K)) @ b0.T,
+                    np.broadcast_to(a0_np[:1], (M, K)) @ b0_np.T,
+                ),
+                (
+                    mx.stack([a0] * 3) @ mx.swapaxes(b[1, :, :, :K], -1, -2),
+                    np.stack([a0_np] * 3) @ np.swapaxes(b_np[1, :, :, :K], -1, -2),
+                ),
+                (
+                    mx.stack([a0] * 3)[::2] @ mx.swapaxes(b[:, ::2, :, :K], -1, -2),
+                    np.stack([a0_np] * 3)[::2]
+                    @ np.swapaxes(b_np[:, ::2, :, :K], -1, -2),
+                ),
+            ]
+            for i, (out, ref) in enumerate(cases):
+                with self.subTest(shape=(M, N, K), case=i):
+                    self.assertEqual(out.shape, ref.shape)
+                    self.assertTrue(np.allclose(out, ref, rtol=1e-4, atol=1e-3))
+
     def test_addmm_grad(self):
         def make_ref_addmm(alpha, beta):
             return lambda c, a, b: alpha * (a @ b) + beta * c

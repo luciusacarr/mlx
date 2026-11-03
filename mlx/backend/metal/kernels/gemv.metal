@@ -46,6 +46,38 @@ instantiate_gemv_blocks(bfloat16, bfloat16_t);
 instantiate_gemv_blocks(complex64, complex64_t);
 
 // clang-format off
+#define instantiate_gemv_multi_helper(name, itype, bm, bn, tm, tn, nv, nc) \
+  instantiate_kernel(                                                    \
+      "gemv_multi_" #name "_bm" #bm "_bn" #bn "_tm" #tm "_tn" #tn        \
+      "_nv" #nv "_nc" #nc,                                               \
+      gemv_multi, itype, bm, bn, tm, tn, nv, nc)
+
+#define instantiate_gemv_multi(name, itype, bm, bn, tm, tn, nv)     \
+  instantiate_gemv_multi_helper(name, itype, bm, bn, tm, tn, nv, 0) \
+  instantiate_gemv_multi_helper(name, itype, bm, bn, tm, tn, nv, 1)
+
+#define instantiate_gemv_multi_nv(name, itype, bm, bn, tm, tn) \
+  instantiate_gemv_multi(name, itype, bm, bn, tm, tn, 2)       \
+  instantiate_gemv_multi(name, itype, bm, bn, tm, tn, 4)       \
+  instantiate_gemv_multi(name, itype, bm, bn, tm, tn, 8) // clang-format on
+
+instantiate_gemv_multi_nv(float32, float, 1, 8, 1, 4)
+instantiate_gemv_multi_nv(float32, float, 1, 16, 1, 4)
+instantiate_gemv_multi_nv(float32, float, 1, 8, 2, 4)
+instantiate_gemv_multi_nv(float32, float, 1, 16, 2, 4)
+instantiate_gemv_multi_nv(float32, float, 1, 8, 4, 4)
+instantiate_gemv_multi_nv(float16, half, 1, 8, 1, 4)
+instantiate_gemv_multi_nv(float16, half, 1, 16, 1, 4)
+instantiate_gemv_multi_nv(float16, half, 1, 8, 2, 4)
+instantiate_gemv_multi_nv(float16, half, 1, 16, 2, 4)
+instantiate_gemv_multi_nv(float16, half, 1, 8, 4, 4)
+instantiate_gemv_multi_nv(bfloat16, bfloat16_t, 1, 8, 1, 4)
+instantiate_gemv_multi_nv(bfloat16, bfloat16_t, 1, 16, 1, 4)
+instantiate_gemv_multi_nv(bfloat16, bfloat16_t, 1, 8, 2, 4)
+instantiate_gemv_multi_nv(bfloat16, bfloat16_t, 1, 16, 2, 4)
+instantiate_gemv_multi_nv(bfloat16, bfloat16_t, 1, 8, 4, 4)
+
+// clang-format off
 #define instantiate_gemv_bs_helper(nm, itype, bm, bn, sm, sn, tm, tn) \
   instantiate_kernel(                                                 \
     "gemv_gather_" #nm "_bm" #bm "_bn" #bn "_sm" #sm                  \
