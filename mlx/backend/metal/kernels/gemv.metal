@@ -82,7 +82,12 @@ instantiate_gemv_bs_blocks(complex64, complex64_t);
   instantiate_gemv_t(name, itype, 1, 2,  8, 4, 4, 4) \
   instantiate_gemv_t(name, itype, 1, 4,  8, 4, 4, 4) \
   instantiate_gemv_t(name, itype, 1, 16, 8, 4, 4, 4) \
-  instantiate_gemv_t(name, itype, 1, 16, 4, 8, 4, 4) // clang-format on
+  instantiate_gemv_t(name, itype, 1, 16, 4, 8, 4, 4) \
+  instantiate_gemv_t(name, itype, 16, 1, 8, 4, 4, 1) \
+  instantiate_gemv_t(name, itype, 16, 1, 8, 4, 4, 4) \
+  instantiate_gemv_t(name, itype, 8, 4,  8, 4, 4, 4) \
+  instantiate_gemv_t(name, itype, 2, 16, 8, 4, 4, 4) \
+  instantiate_gemv_t(name, itype, 2, 16, 4, 8, 4, 4) // clang-format on
 
 // clang-format off
 instantiate_gemv_t_blocks(float32, float);

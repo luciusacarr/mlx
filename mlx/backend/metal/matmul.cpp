@@ -1260,6 +1260,19 @@ void gemv_axbpy(
     // Specialized kernel for very small outputs
     tn = out_vector_len < tn ? 1 : tn;
 
+    // A small grid leaves most of the GPU idle. Then use more threadgroups
+    // and split K over more simdgroups in each threadgroup.
+    n_out_per_tgp = bn * sn * tn;
+    int n_tgp = (out_vector_len + n_out_per_tgp - 1) / n_out_per_tgp;
+    if (in_vector_len >= 256 && n_tgp * batch_size_out < 32) {
+      if (out_vector_len < 4096) {
+        bn = out_vector_len < 512 ? 1 : 4;
+        sm = 8;
+        sn = 4;
+      }
+      bm = std::min(16, 32 / bn);
+    }
+
     n_out_per_tgp = bn * sn * tn;
     kname << "gemv_t_" << type_to_name(out);
 
@@ -1334,7 +1347,8 @@ void gemv_axbpy(
 
     compute_encoder.set_vector_bytes(C_batch_stride, 13);
 
-    int bias_stride = c.strides()[c.ndim() - 1];
+    // For N == 1 the output runs along dim -2 of c
+    int bias_stride = c.strides()[c.ndim() - (is_b_matrix ? 1 : 2)];
     compute_encoder.set_bytes(bias_stride, 14);
   }
 
