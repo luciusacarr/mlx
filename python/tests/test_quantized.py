@@ -131,6 +131,29 @@ class TestQuantized(mlx_tests.MLXTestCase):
         w_hat = mx.dequantize(w_q, scales, mode="mxfp4")
         self.assertTrue(mx.all(w_hat == 0))
 
+    def test_fp4_quantize_ties_to_even(self):
+        # Ties, the FP4 values, values near each tie, then NaN
+        vals = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
+        codes = [0, 2, 2, 4, 4, 6, 6]
+        vals += [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+        codes += list(range(8))
+        vals += [0.2, 0.3, 0.7, 0.8, 1.2, 1.3, 1.7, 1.8, 2.4, 2.6, 3.4, 3.6, 4.9, 5.1]
+        codes += [0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7]
+        vals += [-v for v in vals] + [float("nan"), -float("nan")]
+        codes += [c + 8 for c in codes] + [7, 7]
+
+        for mode, gs, one in [("mxfp4", 32, 127), ("nvfp4", 16, 0x38)]:
+            # The 6.0 in each group makes the scale 1
+            w = mx.zeros((len(vals), gs))
+            w[:, 0] = mx.array(vals)
+            w[:, 1] = 6.0
+            for dtype in [mx.float32, mx.float16, mx.bfloat16]:
+                with self.subTest(mode=mode, dtype=dtype):
+                    w_q, scales = mx.quantize(w.astype(dtype), mode=mode)
+                    # The scale of a group with NaN depends on the backend
+                    self.assertTrue(mx.all(scales[:-2] == one).item())
+                    self.assertEqual((w_q[:, 0] & 0xF).tolist(), codes)
+
     def test_mxfp8_quantize_dequantize(self):
         w = 2 * mx.random.uniform(shape=(512, 32)) - 1
         w = w.astype(mx.bfloat16)

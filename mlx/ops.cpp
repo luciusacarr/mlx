@@ -5345,27 +5345,24 @@ std::vector<array> fp_quantize(
       scales = astype(add(scales, array(127, int32), s), uint8, s);
     }
     if (bits == 4) {
-      auto lut = array({
-          +0.0f,
-          +0.5f,
-          +1.0f,
-          +1.5f,
-          +2.0f,
-          +3.0f,
-          +4.0f,
-          +6.0f,
-          -0.0f,
-          -0.5f,
-          -1.0f,
-          -1.5f,
-          -2.0f,
-          -3.0f,
-          -4.0f,
-          -6.0f,
-      });
-      lut = astype(lut, w.dtype(), s);
-      wq = argmin(
-          abs(subtract(expand_dims(wq, -1, s), lut, s), s), -1, false, s);
+      // Round to nearest E2M1 with ties to even, same as to_fp4_e2m1.
+      // The odd bounds are one step lower, so ties on them round up.
+      auto bounds = array(
+          {0.25f,
+           std::nextafter(0.75f, 0.0f),
+           1.25f,
+           std::nextafter(1.75f, 0.0f),
+           2.5f,
+           std::nextafter(3.5f, 0.0f),
+           5.0f});
+      wq = astype(wq, float32, s);
+      auto code = searchsorted(bounds, abs(wq, s), "left", s);
+      // 1 / x is -inf for -0.0, so -0.0 also gets the sign bit.
+      auto zero = array(0.0f);
+      auto negative = logical_or(
+          less(wq, zero, s), less(divide(array(1.0f), wq, s), zero, s), s);
+      code = where(negative, add(code, array(8, uint32), s), code, s);
+      wq = where(isnan(wq, s), array(7, uint32), code, s);
       auto shifts = power(array(2, uint32), arange(0, 32, 4, uint32, s), s);
       wq = reshape(wq, {-1, 4, 8}, s);
       wq = sum(multiply(wq, shifts, s), -1, false, s);
