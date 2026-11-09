@@ -440,6 +440,39 @@ void eval(std::vector<array> outputs) {
   eval_impl(std::move(outputs), false).wait();
 }
 
+namespace {
+
+// The vjp of a slice or a gather scatters the cotangent in an array of zeros
+// the size of the input, which is then added to the cotangent of the input.
+// Reading an array piece by piece costs the whole array per piece that way.
+// If `a` is a slice or a gather of its first input, add `cotan` directly in
+// `acc`, the cotangent of that input, and return true.
+bool accumulate_piece(
+    array& acc,
+    const array& a,
+    const array& cotan,
+    Stream s) {
+  if (acc.dtype() != cotan.dtype()) {
+    return false;
+  }
+  detail::RetainGraph retain;
+  auto& p = a.primitive();
+  if (typeid(p) == typeid(Slice)) {
+    auto [start, stop, strides] = static_cast<Slice&>(p).state();
+    acc = slice_update_add(acc, cotan, start, stop, strides, s);
+    return true;
+  }
+  if (typeid(p) == typeid(Gather)) {
+    auto axes = static_cast<Gather&>(p).state().first;
+    std::vector<array> indices(a.inputs().begin() + 1, a.inputs().end());
+    acc = scatter_add(acc, indices, cotan, axes, s);
+    return true;
+  }
+  return false;
+}
+
+} // namespace
+
 std::pair<std::vector<array>, std::vector<array>> vjp(
     const std::function<std::vector<array>(const std::vector<array>&)>& fun,
     const std::vector<array>& primals,
@@ -580,6 +613,15 @@ std::pair<std::vector<array>, std::vector<array>> vjp(
         cotangents.push_back(cotan_map.extract(cotan_it).mapped());
       } else {
         cotangents.push_back(zeros_like(o, s));
+      }
+    }
+
+    // Add the cotangent of a piece of an array in the cotangent of the array
+    if (argnums.size() == 1 && argnums[0] == 0) {
+      auto cotan_it = cotan_map.find(a.inputs()[0].id());
+      if (cotan_it != cotan_map.end() &&
+          accumulate_piece(cotan_it->second, a, cotangents[0], s)) {
+        continue;
       }
     }
 

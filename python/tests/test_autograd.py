@@ -1781,6 +1781,89 @@ class TestAutograd(mlx_tests.MLXTestCase):
                 mx.allclose(hvp(f, y, w), numerical_hvp(f, y, w), atol=1e-3)
             )
 
+    def test_grad_accumulates_slices_and_gathers(self):
+        # Reading an array in several pieces accumulates the cotangents of the
+        # pieces in the cotangent of the array.
+        x = mx.random.normal((12, 6))
+        x_np = np.array(x)
+
+        def expected(indices, weights):
+            g = np.zeros_like(x_np)
+            for idx, w in zip(indices, weights):
+                np.add.at(g, idx, w * 2 * x_np[idx])
+            return g
+
+        cases = [
+            # overlapping slices
+            [slice(0, 8), slice(4, 12), slice(None)],
+            # strided and negative strided slices
+            [slice(1, 11, 3), slice(None, None, -1), slice(9, 2, -2)],
+            # integers, including a repeated one
+            [0, 5, 5, 11, -1],
+            # index arrays with repeated entries
+            [np.array([0, 0, 3]), np.array([3, 7, 7, 7])],
+            # mixed
+            [slice(2, 9), 4, np.array([4, 4, 8]), (slice(None), 2), (3, 5)],
+        ]
+        for indices in cases:
+            weights = [float(i + 1) for i in range(len(indices))]
+
+            def fun(x):
+                total = 0
+                for idx, w in zip(indices, weights):
+                    if isinstance(idx, np.ndarray):
+                        idx = mx.array(idx)
+                    total = total + w * (x[idx] ** 2).sum()
+                return total
+
+            self.assertTrue(
+                np.allclose(mx.grad(fun)(x), expected(indices, weights), atol=1e-5)
+            )
+
+        # Pieces of a different type than the array
+        def fun(x):
+            return sum(
+                (x[i].astype(mx.float16) * 2).sum().astype(mx.float32) for i in range(4)
+            )
+
+        g = np.zeros_like(x_np)
+        g[:4] = 2
+        self.assertTrue(np.array_equal(mx.grad(fun)(x), g))
+
+        # Many pieces, in one pass over the array and in the second order
+        def fun(x):
+            return sum((p**3).sum() for p in mx.split(x, 12)) + sum(
+                (x[i] ** 3).sum() for i in range(12)
+            )
+
+        self.assertTrue(np.allclose(mx.grad(fun)(x), 6 * x_np**2, atol=1e-4))
+        gg = mx.grad(lambda x: mx.grad(fun)(x).sum())(x)
+        self.assertTrue(np.allclose(gg, 12 * x_np, atol=1e-4))
+
+    def test_grad_of_pieces_memory(self):
+        # The backward pass of an array read in n pieces does not allocate n
+        # arrays of the size of the array.
+        x = mx.random.normal((1024, 1024))
+        mx.eval(x)
+
+        def by_slices(x):
+            return sum((x[i * 16 : (i + 1) * 16] ** 2).sum() for i in range(64))
+
+        def by_index(x):
+            return sum((x[i] ** 2).sum() for i in range(256))
+
+        expected = [2 * x, mx.concatenate([2 * x[:256], mx.zeros((768, 1024))])]
+        for fun, expected in zip((by_slices, by_index), expected):
+            mx.eval(mx.grad(fun)(x))
+            mx.synchronize()
+            mx.reset_peak_memory()
+            base = mx.get_active_memory()
+            g = mx.grad(fun)(x)
+            mx.eval(g)
+            mx.synchronize()
+            self.assertLess(mx.get_peak_memory() - base, 4 * x.nbytes)
+            self.assertTrue(mx.allclose(g, expected))
+
     def test_transform_releases_captures(self):
         for transform in (
             mx.compile,
