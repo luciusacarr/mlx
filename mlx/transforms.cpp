@@ -442,17 +442,25 @@ void eval(std::vector<array> outputs) {
 
 namespace {
 
+// Accumulate a piece in place when the input is at least this many times larger
+constexpr size_t MIN_PIECE_RATIO = 8;
+
 // The vjp of a slice or a gather scatters the cotangent in an array of zeros
 // the size of the input, which is then added to the cotangent of the input.
 // Reading an array piece by piece costs the whole array per piece that way.
-// If `a` is a slice or a gather of its first input, add `cotan` directly in
-// `acc`, the cotangent of that input, and return true.
+// If `a` is a small slice or gather of its first input, add `cotan` directly
+// in `acc`, the cotangent of that input, and return true.
 bool accumulate_piece(
     array& acc,
     const array& a,
     const array& cotan,
     Stream s) {
-  if (acc.dtype() != cotan.dtype()) {
+  // The vjp casts the cotangent to the type of the input
+  if (acc.dtype() != cotan.dtype() || acc.dtype() != a.inputs()[0].dtype()) {
+    return false;
+  }
+  // Adding a few large pieces is not faster than the dense add
+  if (cotan.size() * MIN_PIECE_RATIO > acc.size()) {
     return false;
   }
   detail::RetainGraph retain;

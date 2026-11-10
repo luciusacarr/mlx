@@ -1784,7 +1784,7 @@ class TestAutograd(mlx_tests.MLXTestCase):
     def test_grad_accumulates_slices_and_gathers(self):
         # Reading an array in several pieces accumulates the cotangents of the
         # pieces in the cotangent of the array.
-        x = mx.random.normal((12, 6))
+        x = mx.random.normal((40, 6))
         x_np = np.array(x)
 
         def expected(indices, weights):
@@ -1795,15 +1795,17 @@ class TestAutograd(mlx_tests.MLXTestCase):
 
         cases = [
             # overlapping slices
-            [slice(0, 8), slice(4, 12), slice(None)],
+            [slice(0, 5), slice(3, 8), slice(4, 6), slice(36, 40)],
             # strided and negative strided slices
-            [slice(1, 11, 3), slice(None, None, -1), slice(9, 2, -2)],
+            [slice(1, 11, 3), slice(9, 2, -2), slice(39, 35, -1)],
             # integers, including a repeated one
-            [0, 5, 5, 11, -1],
+            [0, 5, 5, 39, -1],
             # index arrays with repeated entries
             [np.array([0, 0, 3]), np.array([3, 7, 7, 7])],
-            # mixed
-            [slice(2, 9), 4, np.array([4, 4, 8]), (slice(None), 2), (3, 5)],
+            # small pieces after the whole array and a large piece
+            [slice(None), slice(2, 30), 4, np.array([4, 4, 8]), (3, 5)],
+            # the whole array and a large piece after small pieces
+            [7, slice(6, 9), slice(None, None, -1), (slice(None), 2)],
         ]
         for indices in cases:
             weights = [float(i + 1) for i in range(len(indices))]
@@ -1820,20 +1822,17 @@ class TestAutograd(mlx_tests.MLXTestCase):
                 np.allclose(mx.grad(fun)(x), expected(indices, weights), atol=1e-5)
             )
 
-        # Pieces of a different type than the array
-        def fun(x):
-            return sum(
-                (x[i].astype(mx.float16) * 2).sum().astype(mx.float32) for i in range(4)
-            )
-
-        g = np.zeros_like(x_np)
-        g[:4] = 2
-        self.assertTrue(np.array_equal(mx.grad(fun)(x), g))
+        # The cotangent is cast to the type of the array whatever the order
+        for dtype in (mx.bool_, mx.int8):
+            y = mx.ones((16,)).astype(dtype)
+            g1 = mx.grad(lambda y: 3 * y.sum() + 300 * y[1:3].sum())(y)
+            g2 = mx.grad(lambda y: 300 * y[1:3].sum() + 3 * y.sum())(y)
+            self.assertTrue(mx.array_equal(g1, g2))
 
         # Many pieces, in one pass over the array and in the second order
         def fun(x):
-            return sum((p**3).sum() for p in mx.split(x, 12)) + sum(
-                (x[i] ** 3).sum() for i in range(12)
+            return sum((p**3).sum() for p in mx.split(x, 20)) + sum(
+                (x[i] ** 3).sum() for i in range(40)
             )
 
         self.assertTrue(np.allclose(mx.grad(fun)(x), 6 * x_np**2, atol=1e-4))
